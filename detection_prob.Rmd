@@ -1,0 +1,403 @@
+---
+title: "Bird survey detection probability"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(here)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(stringr)
+library(tidyr)
+
+library(runjags)
+
+
+# Default black and white theme for graphs
+theme_set( theme_bw() )
+
+    
+# convenience function to load contents of an RData file
+# into a named object
+load_from <- function(.path) {
+  load(.path)
+  objs <- ls(all.names = FALSE)
+  get(objs[1], inherits = FALSE)
+}
+
+
+# Set to TRUE to force re-fitting of models
+REFIT_MODEL <- FALSE
+
+```
+
+### Contents
+
+The following R code was used to estimate and graph species and guild detection probabilities in Franklin et al. (in review). It is based on the original version written by Michael Bedward, University of Wollongong.
+
+
+### Survey data
+
+```{r}
+
+path <- here("all_survey_recs.csv")
+DAT.survey <- read.csv(path, stringsAsFactors = FALSE)
+
+
+# Number of replicates per site under each survey method
+Replicates <- DAT.survey %>%
+  group_by(site, survey) %>%
+  summarize(nreps = max(rep)) %>%
+  ungroup() %>%
+  tidyr::spread(survey, nreps)
+
+
+# Species codes, names and info
+path <- here("species_lookup.csv")
+SpeciesLookup <- read.csv(path, stringsAsFactors = FALSE)
+
+```
+
+
+### Model code
+
+```{r}
+
+model.code <- "model {
+  for (site in 1:nsites) {
+    for (sp in 1:nspp) {
+      # Model the observations
+      for (m in 1:nmethods) {
+        num.obs[site,sp,m] ~ dbin(present[site,sp] * p.detect[sp,m], nreps[site,m])
+      }
+
+      # Model the true (unknown) presences
+      present[site,sp] ~ dbern(p.present[site,sp])
+      logit(p.present[site,sp]) <- alpha.present.site[site,sp] + beta.site[site]
+      alpha.present.site[site,sp] ~ dnorm(alpha.present[sp], 1)
+    }
+  }
+  
+  for (sp in 1:nspp) {
+    for (m in 1:nmethods) {
+      logit(p.detect[sp,m]) <- alpha.detect.m[sp,m]
+      alpha.detect.m[sp,m] ~ dnorm(alpha.detect[sp], 1)
+    }
+    
+    alpha.present[sp] ~ dnorm(0, tau.present)
+    alpha.detect[sp] ~ dnorm(0, tau.detect)
+  }
+
+  for (site in 1:nsites) {
+    beta.site[site] ~ dnorm(0, 1)
+  }
+
+  sd.present ~ dexp(1)
+  tau.present <- pow(sd.present, -2)
+
+  sd.detect ~ dexp(1)
+  tau.detect <- pow(sd.detect, -2)
+}"
+
+```
+
+
+### Assemble data and compile model
+
+```{r}
+
+dat.counts <- DAT.survey %>%
+  left_join(SpeciesLookup %>% select(spnum, speciescode), by = "speciescode") %>%
+  group_by(site, spnum, survey) %>%
+  summarize(nobs = sum(observed)) %>%
+  ungroup() %>%
+  tidyr::spread(survey, nobs)
+
+# function to format data as a site x sp matrix for each survey method
+make_matrix <- function(survey.method) {
+  dat.counts %>%
+    select(site, spnum, nobs = survey.method) %>%
+    tidyr::spread(spnum, nobs) %>%
+    select(-site) %>%
+    as.matrix()
+}
+
+# combine the two matrices into a 3D array for the model
+ar.counts <- abind::abind(make_matrix("acoustic"), make_matrix("standard"), along = 3)
+
+
+model.data <- list(
+  nsites = 10,
+  nspp = 48,
+  nmethods = 2,
+  nreps = as.matrix(Replicates[, c("acoustic", "standard")]),
+  num.obs = ar.counts
+)
+
+
+ModelPath <- here("model.RData")
+
+if (REFIT_MODEL || !file.exists(ModelPath)) {
+  model <- run.jags(
+    model = model.code, 
+    monitor = c("alpha.detect.m", "alpha.present", "beta.site"), 
+    data = model.data, 
+    
+    burnin = 4000,
+    sample = 2000,
+    n.chains = 4,
+    thin = 20,
+    
+    method = "parallel",
+    
+    inits = function() {
+      list(present = matrix(1, nrow = 10, ncol = 48))
+    },
+    
+    modules = "glm")
+  
+  save(model, file = ModelPath)
+  
+} else {
+  # load previously fitted model
+  model <- load_from(ModelPath)
+}
+
+```
+
+
+### Check model convergence
+
+```{r}
+
+x <- summary(model)
+
+cat("Min effective samples:", min(x[, "SSeff"]), "\n")
+max.gelman <- cat("Max Gelman-Rubin value:", max(x[, "psrf"]), "\n")
+
+```
+
+
+### Summarize site effects for inspection
+
+In the model, we allow for general site effects such as, for example, a habitat state that increases or reduces the probability of occupancy across all species, by including a term for site.
+
+```{r}
+
+samples <- do.call(rbind, model$mcmc)
+
+ii <- str_detect(colnames(samples), "beta.site")
+
+dat.site <- samples[, ii] %>%
+  as.data.frame() %>%
+  
+  mutate(iter = row_number()) %>%
+  
+  tidyr::gather(param, value, -iter) %>%
+  
+  mutate(site = as.integer(str_extract(param, "\\d+"))) %>%
+  
+  select(iter, site, value)
+
+
+dat.gg <- dat.site %>%
+  group_by(site) %>%
+  
+  summarize(lwr90 = quantile(value, 0.05),
+            lwr50 = quantile(value, 0.25),
+            mid = median(value),
+            upr50 = quantile(value, 0.75),
+            upr90 = quantile(value, 0.95)) %>%
+  
+  ungroup()
+
+
+ggplot(data = dat.gg, aes(x = site)) +
+  geom_linerange(aes(ymin = lwr90, ymax = upr90),
+                 size = 1) +
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50),
+                 size = 2.5) +
+  
+  geom_point(aes(y = mid), size = 4) +
+  
+  scale_x_continuous(breaks = 1:max(dat.gg$site)) +
+  
+  labs(y = "Site effect", x = "Site number") +
+  
+  coord_flip() +
+  
+  theme(panel.grid.minor = element_blank())
+
+```
+
+
+### Graph probability of detection
+
+```{r fig.width=6, fig.height=8}
+
+ii <- str_detect(colnames(samples), "alpha.detect")
+
+dat.detect <- samples[, ii] %>%
+  as.data.frame() %>%
+  
+  mutate(iter = row_number()) %>%
+  
+  tidyr::gather(param, value, -iter) %>%
+  
+  mutate(inds = str_extract(param, "\\d+,\\d")) %>%
+  
+  tidyr::separate(inds, into = c("spnum", "survey"), convert = TRUE) %>%
+  
+  select(iter, spnum, survey, value) %>%
+  
+  mutate(survey = c("acoustic", "standard")[survey],
+         prob = plogis(value))
+       
+
+dat.gg <- dat.detect %>%
+  group_by(spnum, survey) %>%
+  
+  summarize(lwr90 = quantile(prob, 0.05),
+            lwr50 = quantile(prob, 0.25),
+            mid = median(prob),
+            upr50 = quantile(prob, 0.75),
+            upr90 = quantile(prob, 0.95)) %>%
+  
+  ungroup() %>%
+  
+  left_join(SpeciesLookup %>% select(spnum, speciescode), by = "spnum")
+
+
+Levels <- dat.gg %>%
+  filter(survey == "acoustic") %>%
+  arrange(mid) %>%
+  select(speciescode)
+
+
+dat.gg$speciescode <- factor(dat.gg$speciescode, levels = Levels$speciescode)
+
+dat.gg.mid <- dat.gg %>%
+  select(speciescode, survey, mid) %>%
+  tidyr::spread(survey, mid)
+
+
+  
+ggplot(data = dat.gg,  aes(x = speciescode)) +
+  geom_linerange(data = dat.gg.mid, 
+                 aes(ymin = acoustic, ymax = standard),
+                 size = 3, colour = "grey90") +
+
+  geom_linerange(aes(ymin = lwr90, ymax = upr90, colour = survey),
+                 position = position_dodge(width = 0.2),
+                 size = 1) + 
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = survey),
+                 position = position_dodge(width = 0.2),
+                 size = 2.5) + 
+ 
+  coord_flip() +
+  
+  scale_color_manual(values=c("standard" = "goldenrod1", "acoustic" = "royalblue")) + 
+  
+  xlab("Species code") + ylab("Probability of detection") + 
+  
+  theme(legend.position = "none", text=element_text(size=9))
+
+```
+
+### Probability that acoustic survey had better detection rates
+
+Here we calculate the probability that acoustic sampling gives better detection rates for each species
+
+```{r}
+
+ dat <- dat.detect %>%
+  select(iter, spnum, survey, prob) %>%
+  tidyr::spread(survey, prob) %>%
+  
+  mutate(diff = acoustic - standard) %>%
+  
+  group_by(spnum) %>%
+  summarize(p.acoustic.better = mean(diff > 0)) %>%
+  
+  left_join(SpeciesLookup %>% select(spnum, speciescode), by = "spnum") %>%
+  
+  select(speciescode, p.acoustic.better)
+
+knitr::kable(dat, digits = 2)
+
+```
+
+### Summarize probability of detection by species groupings
+
+Here we query the posterior distribution of the existing, ungrouped species model, and summarize probability of detection for each foraging stratum guild. This involves aggregating the posterior samples according to guild membership. This is somewhat approximate because the guilds differ in number of species. We indicate this in the graph labels.
+
+```{r fig.width=2.9, fig.height=2.5}
+
+dat.n <- SpeciesLookup %>%
+  group_by(foragingstratum) %>%
+  summarize(count = n())
+
+dat.gg <- dat.detect %>%
+  left_join(SpeciesLookup, by = "spnum") %>%
+  
+  group_by(foragingstratum, survey) %>%
+  
+  summarize(lwr90 = quantile(prob, 0.05),
+            lwr50 = quantile(prob, 0.25),
+            mid = median(prob),
+            upr50 = quantile(prob, 0.75),
+            upr90 = quantile(prob, 0.95)) %>%
+  
+  ungroup() %>%
+  
+  left_join(dat.n, by = "foragingstratum") %>%
+  mutate(label = paste0(foragingstratum, " (", count, ")"))
+
+
+dodgew <- 0.5
+
+abrev <- c("A/G (2)", "All (29)", "C/S (8)", "G/U (9)")
+
+ggplot(data = dat.gg, aes(x = label)) +
+  geom_linerange(aes(ymin = lwr90, ymax = upr90, colour = survey),
+                 position = position_dodge(width = dodgew),
+                 size = 1) +
+  
+  geom_linerange(aes(ymin = lwr50, ymax = upr50, colour = survey),
+                 position = position_dodge(width = dodgew),
+                 size = 2.5) +
+  
+  geom_point(aes(y = mid, colour = survey),
+                 position = position_dodge(width = dodgew),
+                 size = 4) +
+  
+  
+  labs(x = "Foraging stratum guilds", y = "Probability of detection") +
+  
+  scale_color_manual(values=c("standard" = "goldenrod1", "acoustic" = "royalblue")) + 
+  
+  theme(legend.position = "none", text=element_text(size=9)) +
+  
+  coord_flip(ylim = c(0, 1)) +
+  
+  scale_x_discrete(labels= abrev)
+
+```
+
+
+
+
+
+
+
+
+
+
+
